@@ -394,7 +394,27 @@ app.post('/admin/cleanup', requireIngest, async (req, res) => {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+app.post('/admin/purge', requireIngest, async (req, res) => {
+  try {
+    if (!hasDb) {
+      const deleted = memSnaps.length;
+      memSnaps.splice(0, memSnaps.length);
+      return res.json({ ok: true, db: 'memory', deleted });
+    }
 
+    await pool.query('TRUNCATE TABLE snapshots RESTART IDENTITY');
+
+    res.json({
+      ok: true,
+      db: 'postgres',
+      deleted: 'all',
+      message: 'snapshots table truncated'
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 app.post('/ingest/snaps', requireIngest, async (req, res) => {
   try {
     await maybeCleanupOldSnapshots();
