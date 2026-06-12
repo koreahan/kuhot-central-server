@@ -1,4 +1,3 @@
-```js
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -61,10 +60,14 @@ function optionKeyFromText(text) {
   const tokens = [];
   const re = new RegExp('(\\d+(?:\\.\\d+)?)\\s*(' + unit + ')', 'gi');
   let m;
-  while ((m = re.exec(raw))) tokens.push(`${m[1]}${String(m[2]).toLowerCase()}`);
+  while ((m = re.exec(raw))) {
+  tokens.push(String(m[1]) + String(m[2]).toLowerCase());
+}
 
   const mul = new RegExp('(\\d+)\\s*x\\s*(\\d+)\\s*(' + unit + ')', 'gi');
-  while ((m = mul.exec(raw))) tokens.push(`${m[1]}x${m[2]}${String(m[3]).toLowerCase()}`);
+  while ((m = mul.exec(raw))) {
+  tokens.push(String(m[1]) + 'x' + String(m[2]) + String(m[3]).toLowerCase());
+}
 
   return [...new Set(tokens)].sort().join('|') || 'default';
 }
