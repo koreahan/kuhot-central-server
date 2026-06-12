@@ -1,22 +1,29 @@
+```js
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const PORT = Number(process.env.PORT || 3000);
 const INGEST_KEY = String(process.env.KUHOT_INGEST_KEY || 'CHANGE_ME_LONG_RANDOM_KEY');
 const READ_KEY = String(process.env.KUHOT_READ_KEY || '');
 const DATABASE_URL = process.env.DATABASE_URL || '';
+const RETENTION_DAYS = Number(process.env.KUHOT_RETENTION_DAYS || 7);
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
 const hasDb = Boolean(DATABASE_URL);
-const pool = hasDb ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false } }) : null;
+const pool = hasDb
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false }
+    })
+  : null;
 
 const memSnaps = [];
 let memId = 1;
+let LAST_CLEANUP_MS = 0;
 
 function nowMs() {
   return Date.now();
@@ -79,6 +86,11 @@ function bigNeedPct(price) {
   return 35;
 }
 
+function extractProductId(url) {
+  const m = String(url || '').match(/\/vp\/products\/(\d+)/i);
+  return m ? m[1] : '';
+}
+
 function normalizeSnap(raw) {
   const title = normSpace(raw.title || raw.name || raw.productName || '');
   const url = normSpace(raw.url || raw.href || '');
@@ -93,12 +105,20 @@ function normalizeSnap(raw) {
   const category = normSpace(raw.category || classifyCategory(title));
   const tsMs = toInt(raw.tsMs || raw.tsUtc || raw.timestamp, nowMs());
 
-  return { title, url, productId, vendorItemId, price, wowPrice, couponOff, cardOff, cardText, optionKey, category, tsMs };
-}
-
-function extractProductId(url) {
-  const m = String(url || '').match(/\/vp\/products\/(\d+)/i);
-  return m ? m[1] : '';
+  return {
+    title,
+    url,
+    productId,
+    vendorItemId,
+    price,
+    wowPrice,
+    couponOff,
+    cardOff,
+    cardText,
+    optionKey,
+    category,
+    tsMs
+  };
 }
 
 function cleanHistory(prices) {
@@ -124,8 +144,62 @@ function meanExOneMin(vals) {
   return Math.round(b.reduce((x, y) => x + y, 0) / b.length);
 }
 
+async function cleanupDuplicateSnapshots() {
+  if (!hasDb) return { db: 'memory', deleted: 0 };
+
+  const r = await pool.query(`
+    DELETE FROM snapshots a
+    USING snapshots b
+    WHERE a.id < b.id
+      AND a.product_id = b.product_id
+      AND a.option_key = b.option_key
+      AND a.ts_ms = b.ts_ms
+  `);
+
+  return { db: 'postgres', deleted: r.rowCount || 0 };
+}
+
+async function cleanupOldSnapshots(days = RETENTION_DAYS) {
+  const keepDays = Math.max(1, Math.min(365, Number(days || 7)));
+  const cutoff = nowMs() - keepDays * 24 * 60 * 60 * 1000;
+
+  if (!hasDb) {
+    const before = memSnaps.length;
+    for (let i = memSnaps.length - 1; i >= 0; i--) {
+      if (Number(memSnaps[i].ts_ms || 0) < cutoff) {
+        memSnaps.splice(i, 1);
+      }
+    }
+    return { db: 'memory', days: keepDays, cutoff, deleted: before - memSnaps.length };
+  }
+
+  const r = await pool.query(
+    `DELETE FROM snapshots WHERE ts_ms < $1`,
+    [cutoff]
+  );
+
+  return { db: 'postgres', days: keepDays, cutoff, deleted: r.rowCount || 0 };
+}
+
+async function maybeCleanupOldSnapshots() {
+  const intervalMs = 60 * 60 * 1000;
+  if (Date.now() - LAST_CLEANUP_MS < intervalMs) return null;
+
+  LAST_CLEANUP_MS = Date.now();
+
+  try {
+    const result = await cleanupOldSnapshots(RETENTION_DAYS);
+    console.log('[cleanupOldSnapshots]', result);
+    return result;
+  } catch (e) {
+    console.error('[cleanupOldSnapshots failed]', e);
+    return null;
+  }
+}
+
 async function initDb() {
   if (!hasDb) return;
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS snapshots (
       id BIGSERIAL PRIMARY KEY,
@@ -151,9 +225,22 @@ async function initDb() {
       ts_ms BIGINT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS idx_snap_product_option_ts ON snapshots(product_id, option_key, ts_ms DESC);
-    CREATE INDEX IF NOT EXISTS idx_snap_deal_ts ON snapshots(is_feed, ts_ms DESC);
-    CREATE INDEX IF NOT EXISTS idx_snap_category_ts ON snapshots(category, ts_ms DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_snap_product_option_ts
+      ON snapshots(product_id, option_key, ts_ms DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_snap_deal_ts
+      ON snapshots(is_feed, ts_ms DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_snap_category_ts
+      ON snapshots(category, ts_ms DESC);
+  `);
+
+  await cleanupDuplicateSnapshots();
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_snap_product_option_ts
+      ON snapshots(product_id, option_key, ts_ms);
   `);
 }
 
@@ -165,8 +252,13 @@ async function historyPricesDb(productId, optionKey, beforeTsMs) {
       .slice(0, 60)
       .map(s => s.price);
   }
+
   const r = await pool.query(
-    `SELECT price FROM snapshots WHERE product_id=$1 AND option_key=$2 AND ts_ms<$3 AND price>0 ORDER BY ts_ms DESC LIMIT 60`,
+    `SELECT price
+     FROM snapshots
+     WHERE product_id=$1 AND option_key=$2 AND ts_ms<$3 AND price>0
+     ORDER BY ts_ms DESC
+     LIMIT 60`,
     [productId, optionKey, beforeTsMs]
   );
   return r.rows.map(x => Number(x.price));
@@ -174,7 +266,9 @@ async function historyPricesDb(productId, optionKey, beforeTsMs) {
 
 async function processOne(raw) {
   const s = normalizeSnap(raw);
-  if (!s.productId || !s.title || !s.price || s.price < 500) return { ok: false, skipped: true, reason: 'bad snap' };
+  if (!s.productId || !s.title || !s.price || s.price < 500) {
+    return { ok: false, skipped: true, reason: 'bad snap' };
+  }
 
   const hist = await historyPricesDb(s.productId, s.optionKey, s.tsMs);
   const basis = cleanHistory(hist);
@@ -211,17 +305,52 @@ async function processOne(raw) {
   };
 
   if (!hasDb) {
+    const duplicate = memSnaps.some(x =>
+      x.product_id === row.product_id &&
+      x.option_key === row.option_key &&
+      Number(x.ts_ms || 0) === Number(row.ts_ms || 0)
+    );
+
+    if (duplicate) return { ok: true, duplicate: true, deal: false, row };
+
     row.id = memId++;
     memSnaps.push(row);
+    await cleanupOldSnapshots(RETENTION_DAYS);
     if (memSnaps.length > 20000) memSnaps.splice(0, memSnaps.length - 20000);
-  } else {
-    await pool.query(
-      `INSERT INTO snapshots(product_id, option_key, vendor_item_id, title, url, category, price, wow_price, coupon_off, card_off, card_text, avg_price, low_price, avg_pct, low_pct, is_feed, is_hot, is_big, is_new_low, ts_ms)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
-      [row.product_id, row.option_key, row.vendor_item_id, row.title, row.url, row.category, row.price, row.wow_price, row.coupon_off, row.card_off, row.card_text, row.avg_price, row.low_price, row.avg_pct, row.low_pct, row.is_feed, row.is_hot, row.is_big, row.is_new_low, row.ts_ms]
-    );
+    return { ok: true, inserted: true, deal: isFeed, row };
   }
-  return { ok: true, deal: isFeed, row };
+
+  const inserted = await pool.query(
+    `INSERT INTO snapshots(product_id, option_key, vendor_item_id, title, url, category, price, wow_price, coupon_off, card_off, card_text, avg_price, low_price, avg_pct, low_pct, is_feed, is_hot, is_big, is_new_low, ts_ms)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+     ON CONFLICT (product_id, option_key, ts_ms) DO NOTHING
+     RETURNING id`,
+    [
+      row.product_id,
+      row.option_key,
+      row.vendor_item_id,
+      row.title,
+      row.url,
+      row.category,
+      row.price,
+      row.wow_price,
+      row.coupon_off,
+      row.card_off,
+      row.card_text,
+      row.avg_price,
+      row.low_price,
+      row.avg_pct,
+      row.low_pct,
+      row.is_feed,
+      row.is_hot,
+      row.is_big,
+      row.is_new_low,
+      row.ts_ms
+    ]
+  );
+
+  const actuallyInserted = inserted.rowCount > 0;
+  return { ok: true, inserted: actuallyInserted, duplicate: !actuallyInserted, deal: actuallyInserted && isFeed, row };
 }
 
 function requireIngest(req, res, next) {
@@ -241,17 +370,39 @@ function requireRead(req, res, next) {
 }
 
 app.get('/health', async (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_CENTRAL_API', version: 'central-v2-feedfix', db: hasDb ? 'postgres' : 'memory', time: nowMs() });
+  res.json({
+    ok: true,
+    service: 'KUHOT_CENTRAL_API',
+    version: 'central-v2-retention-dedupe',
+    db: hasDb ? 'postgres' : 'memory',
+    retentionDays: RETENTION_DAYS,
+    time: nowMs()
+  });
+});
+
+app.post('/admin/cleanup', requireIngest, async (req, res) => {
+  try {
+    const days = Number(req.query.days || req.body?.days || RETENTION_DAYS || 7);
+    const cleanup = await cleanupOldSnapshots(days);
+    const dedupe = await cleanupDuplicateSnapshots();
+    res.json({ ok: true, cleanup, dedupe });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 app.post('/ingest/snaps', requireIngest, async (req, res) => {
   try {
+    await maybeCleanupOldSnapshots();
+
     const arr = Array.isArray(req.body?.items) ? req.body.items : Array.isArray(req.body) ? req.body : [req.body];
     const results = [];
     for (const item of arr.slice(0, 500)) results.push(await processOne(item));
-    const saved = results.filter(r => r.ok).length;
+    const saved = results.filter(r => r.ok && r.inserted).length;
+    const duplicates = results.filter(r => r.ok && r.duplicate).length;
     const deals = results.filter(r => r.ok && r.deal).length;
-    res.json({ ok: true, saved, deals });
+    res.json({ ok: true, saved, duplicates, deals });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
@@ -317,13 +468,36 @@ app.get('/stats', requireRead, async (req, res) => {
   try {
     if (!hasDb) {
       const deals = buildDealsFromRows(memSnaps, 'all', '전체', 1000000);
-      return res.json({ ok: true, db: 'memory', snapshots: memSnaps.length, deals: deals.length, groups: new Set(memSnaps.map(r => `${r.product_id}::${r.option_key}`)).size });
+      return res.json({
+        ok: true,
+        db: 'memory',
+        retentionDays: RETENTION_DAYS,
+        snapshots: memSnaps.length,
+        deals: deals.length,
+        groups: new Set(memSnaps.map(r => `${r.product_id}::${r.option_key}`)).size
+      });
     }
+
     const total = await pool.query('SELECT COUNT(*)::int AS c FROM snapshots');
-    const groups = await pool.query("SELECT COUNT(*)::int AS c FROM (SELECT DISTINCT product_id, option_key FROM snapshots) x");
+    const groups = await pool.query('SELECT COUNT(*)::int AS c FROM (SELECT DISTINCT product_id, option_key FROM snapshots) x');
+    const size = await pool.query(`
+      SELECT
+        pg_total_relation_size('snapshots')::bigint AS bytes,
+        pg_size_pretty(pg_total_relation_size('snapshots')) AS pretty
+    `);
     const sample = await pool.query('SELECT * FROM snapshots ORDER BY ts_ms DESC LIMIT 20000');
     const deals = buildDealsFromRows(sample.rows, 'all', '전체', 1000000);
-    res.json({ ok: true, db: 'postgres', snapshots: total.rows[0].c, groups: groups.rows[0].c, deals_sample: deals.length });
+
+    res.json({
+      ok: true,
+      db: 'postgres',
+      retentionDays: RETENTION_DAYS,
+      snapshots: total.rows[0].c,
+      groups: groups.rows[0].c,
+      deals_sample: deals.length,
+      snapshots_size_bytes: Number(size.rows[0].bytes || 0),
+      snapshots_size: size.rows[0].pretty
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -357,12 +531,20 @@ app.get('/history/:productId', requireRead, async (req, res) => {
     const productId = String(req.params.productId || '');
     const optionKey = String(req.query.optionKey || '');
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 80)));
+
     if (!hasDb) {
-      const items = memSnaps.filter(r => r.product_id === productId && (!optionKey || r.option_key === optionKey)).sort((a, b) => b.ts_ms - a.ts_ms).slice(0, limit);
+      const items = memSnaps
+        .filter(r => r.product_id === productId && (!optionKey || r.option_key === optionKey))
+        .sort((a, b) => b.ts_ms - a.ts_ms)
+        .slice(0, limit);
       return res.json({ ok: true, items });
     }
+
     const r = await pool.query(
-      `SELECT * FROM snapshots WHERE product_id=$1 AND ($2='' OR option_key=$2) ORDER BY ts_ms DESC LIMIT $3`,
+      `SELECT * FROM snapshots
+       WHERE product_id=$1 AND ($2='' OR option_key=$2)
+       ORDER BY ts_ms DESC
+       LIMIT $3`,
       [productId, optionKey, limit]
     );
     res.json({ ok: true, items: r.rows });
@@ -371,9 +553,16 @@ app.get('/history/:productId', requireRead, async (req, res) => {
   }
 });
 
-initDb().then(() => {
-  app.listen(PORT, () => console.log(`[kuhot-central] listening on ${PORT} db=${hasDb ? 'postgres' : 'memory'}`));
+initDb().then(async () => {
+  await cleanupOldSnapshots(RETENTION_DAYS).catch((e) => {
+    console.error('[startup cleanup failed]', e);
+  });
+
+  app.listen(PORT, () => {
+    console.log(`[kuhot-central] listening on ${PORT} db=${hasDb ? 'postgres' : 'memory'} retentionDays=${RETENTION_DAYS}`);
+  });
 }).catch((e) => {
   console.error('[kuhot-central] failed to start', e);
   process.exit(1);
 });
+```
