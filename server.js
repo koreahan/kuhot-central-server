@@ -567,5 +567,4 @@ initDb().then(async () => {
 }).catch((e) => {
   console.error('[kuhot-central] failed to start', e);
   process.exit(1);
-```js
 });
