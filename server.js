@@ -12,6 +12,7 @@ const expo = new Expo();
 const PORT = Number(process.env.PORT || 8787);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const INGEST_KEY = process.env.INGEST_KEY || '';
+const ALERT_RETENTION_MS = Number(process.env.ALERT_RETENTION_MS || 24 * 60 * 60 * 1000); // 기본 24시간 보관
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -34,10 +35,12 @@ function f(v) { const x = Number(v || 0); return Number.isFinite(x) ? x : 0; }
 
 function dedupeKey(a) {
   const product = s(a.productId || a.itemId || a.vendorItemId, 80);
-  const opt = s(a.option || a.optionKey || '', 200).toLowerCase().replace(/\s+/g, ' ');
+  const titleKey = normKey(cleanTitleText(a.title || ''));
+  const opt = normKey(cleanOptionText(a.option || a.optionKey || ''));
   const price = n(a.price || a.payPrice);
   if (product) return `PID:${product}:OPT:${opt}:PRICE:${price}`;
-  return crypto.createHash('sha1').update(`${s(a.title).toLowerCase()}|${opt}|${price}`).digest('hex');
+  // v023: 텔레그램 재가공/직접전송은 공백·이모지·문장부호가 조금씩 달라져도 같은 상품/옵션/가격이면 중복으로 본다.
+  return crypto.createHash('sha1').update(`${titleKey}|${opt}|${price}`).digest('hex');
 }
 
 function normalizeAlert(body) {
@@ -217,28 +220,64 @@ function firstWon(text) {
   return m ? n(m[1].replace(/,/g, '')) : 0;
 }
 
+
+function detectSectionFromText(text, body = {}) {
+  const explicit = s(body.section || body.category || body.kind || body.type || '', 80);
+  if (explicit) return isBigText(explicit) ? '대박' : (explicit.includes('인기') ? '인기' : explicit);
+  const compact = String(text || '').replace(/\s+/g, '');
+  if (/(?:🔥){0,3}대박|대박딜|핫딜대박|초대박|역대급/u.test(compact)) return '대박';
+  if (/인기|실시간핫딜|핫딜/u.test(compact)) return '인기';
+  return '인기';
+}
+
+function looksNoiseTitleLine(line) {
+  const t = s(line, 300);
+  if (!t) return true;
+  if (t.startsWith('※') || t.startsWith('└') || /^https?:\/\//i.test(t)) return true;
+  if (isCategoryOnlyLine(t)) return true;
+  if (/^쿠팡을\s*추천합니다\.?$/u.test(t)) return true;
+  if (/^상세보기|^구매하기|^링크\s*열기/u.test(t)) return true;
+  if (/파트너스활동|수수료를\s*제공/u.test(t)) return true;
+  return false;
+}
+
 function parseTelegramText(text, body = {}) {
   const lines = String(text || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-  const titleLine = lines.find(x => x.startsWith('✨')) || lines.find(x => !x.startsWith('※') && !x.startsWith('└') && !x.startsWith('http') && !isCategoryOnlyLine(x)) || '';
+
+  // 사람이 텔레그램방에 직접 넣은 추천 문구/봇이 재가공한 문구를 모두 받아낸다.
+  // 상품명 후보는 ✨ 라인을 우선하고, 없으면 노이즈/URL/가격 라인을 제외한 첫 줄을 쓴다.
+  const titleLine =
+    lines.find(x => x.startsWith('✨')) ||
+    lines.find(x => !looksNoiseTitleLine(x) && !/[0-9][0-9,]*\s*원/u.test(x) && !x.includes('평균') && !x.includes('최저') && !x.includes('최종')) ||
+    '';
+
   const optionLine = lines.find(x => x.startsWith('└')) || '';
-  const priceLine = lines.find(x => x.includes('최종') || x.includes('혜택가') || x.includes('가격')) || lines.find(x => /[0-9][0-9,]*\s*원/u.test(x)) || lines.find(x => /[（(]\s*[0-9][0-9,]*/u.test(x)) || '';
+  const priceLine =
+    lines.find(x => x.includes('최종') || x.includes('혜택가') || x.includes('가격')) ||
+    lines.find(x => /[0-9][0-9,]*\s*원/u.test(x)) ||
+    lines.find(x => /[（(]\s*[0-9][0-9,]*/u.test(x)) ||
+    '';
   const avgLine = lines.find(x => x.includes('평균')) || '';
   const lowLine = lines.find(x => x.includes('최저')) || '';
   const url = s(body.partnerUrl || body.url || body.link || firstUrl(text), 1000);
   const price = n(body.price || firstWon(priceLine || titleLine));
   const compact = splitCompactTitleOption(body.title || titleLine);
   const title = cleanTitleText(compact.title || body.message || '텔레그램 핫딜');
-  const option = s(body.option || optionLine.replace(/^└\s*/, '') || compact.option, 200);
-  const section = s(body.section || (isBigText(text) ? '대박' : '인기'), 80);
+  const option = cleanOptionText(body.option || optionLine.replace(/^└\s*/, '') || compact.option);
+  const section = detectSectionFromText(text, body);
+  const avg = n(body.avg || firstWon(avgLine));
+  const low = n(body.low || firstWon(lowLine));
+  const dropPct = f(body.dropPct || body.avgDrop || (avg > 0 && price > 0 ? ((avg - price) / avg) * 100 : 0));
+
   return normalizeAlert({
     source: body.source || 'telegram_bridge',
     section,
     title,
     option,
     price,
-    avg: n(body.avg || firstWon(avgLine)),
-    low: n(body.low || firstWon(lowLine)),
-    dropPct: f(body.dropPct || body.avgDrop || 0),
+    avg,
+    low,
+    dropPct,
     appDiscount: f(body.appDiscount || body.discount || 0),
     partnerUrl: url,
     url,
@@ -315,6 +354,37 @@ function allowIngest(req, res) {
   return false;
 }
 
+
+async function pruneOldAlerts() {
+  const cutoff = now() - ALERT_RETENTION_MS;
+  if (!pool) {
+    memory.alerts = memory.alerts.filter(a => n(a.createdAt) >= cutoff);
+    return 0;
+  }
+  const r = await pool.query(`DELETE FROM alerts WHERE created_at < $1`, [cutoff]);
+  return r.rowCount || 0;
+}
+
+async function pruneOldOpens() {
+  const cutoff = now() - ALERT_RETENTION_MS;
+  if (!pool) {
+    memory.opens = memory.opens.filter(o => n(o.openedAt) >= cutoff);
+    return 0;
+  }
+  const r = await pool.query(`DELETE FROM alert_opens WHERE opened_at < $1`, [cutoff]);
+  return r.rowCount || 0;
+}
+
+async function pruneOldData() {
+  try {
+    const alerts = await pruneOldAlerts();
+    const opens = await pruneOldOpens();
+    return { alerts, opens, cutoff: now() - ALERT_RETENTION_MS };
+  } catch (e) {
+    return { alerts: 0, opens: 0, error: String(e.message || e) };
+  }
+}
+
 async function registerDevice(body) {
   const deviceId = s(body.deviceId, 120);
   if (!deviceId) throw new Error('EMPTY_DEVICE_ID');
@@ -327,6 +397,11 @@ async function registerDevice(body) {
     ts: now()
   };
   if (!pool) {
+    if (row.expoPushToken) {
+      for (const [key, value] of memory.devices.entries()) {
+        if (key !== deviceId && value.expoPushToken === row.expoPushToken) memory.devices.delete(key);
+      }
+    }
     memory.devices.set(deviceId, row);
     return row;
   }
@@ -334,17 +409,31 @@ async function registerDevice(body) {
     VALUES ($1,$2,$3,$4,$5,$6,$6)
     ON CONFLICT (device_id) DO UPDATE SET device_name=$2, platform=$3, expo_push_token=$4, settings=$5, updated_at=$6`,
     [row.deviceId, row.deviceName, row.platform, row.expoPushToken, JSON.stringify(row.settings), row.ts]);
+  if (row.expoPushToken) {
+    await pool.query(`DELETE FROM devices WHERE expo_push_token=$1 AND device_id<>$2`, [row.expoPushToken, row.deviceId]);
+  }
   return row;
 }
 
+function uniqueDevicesByPushToken(devices) {
+  const byToken = new Map();
+  for (const d of devices || []) {
+    const token = String(d.expoPushToken || '').trim();
+    if (!token || byToken.has(token)) continue;
+    byToken.set(token, d);
+  }
+  return Array.from(byToken.values());
+}
+
 async function listDevices() {
-  if (!pool) return Array.from(memory.devices.values());
-  const { rows } = await pool.query(`SELECT device_id AS "deviceId", expo_push_token AS "expoPushToken", settings FROM devices WHERE expo_push_token <> ''`);
-  return rows;
+  if (!pool) return uniqueDevicesByPushToken(Array.from(memory.devices.values()));
+  const { rows } = await pool.query(`SELECT device_id AS "deviceId", expo_push_token AS "expoPushToken", settings FROM devices WHERE expo_push_token <> '' ORDER BY updated_at DESC`);
+  return uniqueDevicesByPushToken(rows);
 }
 
 async function insertAlert(alert) {
   if (!alert.title || !alert.price || !alert.url) throw new Error('EMPTY_ALERT_REQUIRED_FIELD');
+  await pruneOldData();
 
   if (!pool) {
     const exists = memory.alerts.find(x => x.dedupeKey === alert.dedupeKey);
@@ -389,6 +478,7 @@ function rowToAlert(r) {
 }
 
 async function getAlerts(limit = 100) {
+  await pruneOldData();
   if (!pool) return memory.alerts.slice(0, limit);
   const { rows } = await pool.query(`SELECT * FROM alerts ORDER BY created_at DESC LIMIT $1`, [Math.min(Math.max(n(limit), 1), 300)]);
   return rows.map(rowToAlert);
@@ -442,12 +532,21 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'WOWDROP_CENTRAL', app: 'KUHOT', version: 'v021-text-parser-fix', mode: pool ? 'postgres' : 'memory', time: now() });
+  res.json({ ok: true, service: 'WOWDROP_CENTRAL', app: 'KUHOT', version: 'v024-notification-detail-no-double', mode: pool ? 'postgres' : 'memory', time: now() });
 });
 
 app.post('/devices/register', async (req, res) => {
   try { res.json({ ok: true, device: await registerDevice(req.body || {}) }); }
   catch (e) { res.status(400).json({ ok: false, error: String(e.message || e) }); }
+});
+
+app.get('/debug/latest', async (req, res) => {
+  try {
+    const alerts = await getAlerts(10);
+    res.json({ ok: true, count: alerts.length, latest: alerts[0] || null, items: alerts.map(a => ({ id: a.id, section: a.section, title: a.title, price: a.price, source: a.source, createdAt: a.createdAt })) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 app.get('/alerts', async (req, res) => {
@@ -457,6 +556,16 @@ app.get('/alerts', async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: String(e.message || e) }); }
 });
 
+
+
+app.post('/maintenance/prune', async (req, res) => {
+  try {
+    const deleted = await pruneOldData();
+    res.json({ ok: true, retentionMs: ALERT_RETENTION_MS, deleted });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 app.get('/alerts/:id', async (req, res) => {
   try {
