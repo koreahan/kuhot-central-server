@@ -10,18 +10,19 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v055-manual-option-dedupe-canonical';
-const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 8);
-const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 120000);
+const SERVER_VERSION = 'v058-fast-retry-timeout';
+const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
+const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 3500);
 const DB_CONNECT_TIMEOUT_MS = Number(process.env.DB_CONNECT_TIMEOUT_MS || 2500);
-const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 2500);
+const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 1500);
 const OBSERVE_BATCH_LIMIT = Number(process.env.OBSERVE_BATCH_LIMIT || 120);
 const EMUL_STATS_BATCH_LIMIT = Number(process.env.EMUL_STATS_BATCH_LIMIT || 120);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const INGEST_KEY = process.env.INGEST_KEY || '';
 const ALERT_RETENTION_MS = Number(process.env.ALERT_RETENTION_MS || 24 * 60 * 60 * 1000); // 앱 알림함 기본 24시간 보관
 const PRICE_RETENTION_MS = Number(process.env.PRICE_RETENTION_MS || 7 * 24 * 60 * 60 * 1000); // 가격 관측 DB 기본 7일 보관
+const PRUNE_INTERVAL_MS = Number(process.env.PRUNE_INTERVAL_MS || 10 * 60 * 1000); // v056: 요청마다 prune하지 않고 주기적으로만 정리
 const COLLECTOR_KEY = process.env.COLLECTOR_KEY || INGEST_KEY || '';
 const OBS_BUCKET_MS = Number(process.env.OBS_BUCKET_MS || 60 * 60 * 1000); // 같은 상품/옵션/가격은 기본 1시간 1건만 관측 저장
 const ALERT_MIN_AVG_DROP_PCT = Number(process.env.ALERT_MIN_AVG_DROP_PCT || 20);
@@ -102,6 +103,9 @@ function emptyStatsFallback(obs, reason = 'stats_timeout') {
 
 let pool = null;
 const memory = { devices: new Map(), alerts: [], opens: [], observations: [], emulStats: [] };
+let lastPruneAt = 0;
+let lastPruneResult = null;
+let pruneInFlight = null;
 
 if (DATABASE_URL) {
   pool = new Pool({
@@ -883,6 +887,22 @@ async function pruneOldData() {
   }
 }
 
+async function pruneOldDataThrottled(force = false) {
+  const ts = now();
+  if (!force && lastPruneResult && ts - lastPruneAt < PRUNE_INTERVAL_MS) {
+    return { ...lastPruneResult, throttled: true, nextPruneInMs: Math.max(0, PRUNE_INTERVAL_MS - (ts - lastPruneAt)) };
+  }
+  if (pruneInFlight) return pruneInFlight;
+  pruneInFlight = pruneOldData()
+    .then((result) => {
+      lastPruneAt = now();
+      lastPruneResult = result;
+      return { ...result, throttled: false };
+    })
+    .finally(() => { pruneInFlight = null; });
+  return pruneInFlight;
+}
+
 async function registerDevice(body) {
   const deviceId = s(body.deviceId, 120);
   if (!deviceId) throw new Error('EMPTY_DEVICE_ID');
@@ -931,7 +951,7 @@ async function listDevices() {
 
 async function insertAlert(alert) {
   if (!alert.title || !alert.price || !alert.url) throw new Error('EMPTY_ALERT_REQUIRED_FIELD');
-  await pruneOldData();
+  await pruneOldDataThrottled();
 
   if (!pool) {
     const exists = memory.alerts.find(x => x.dedupeKey === alert.dedupeKey);
@@ -977,7 +997,7 @@ function rowToAlert(r) {
 }
 
 async function getAlerts(limit = 100) {
-  await pruneOldData();
+  await pruneOldDataThrottled();
   if (!pool) return memory.alerts.slice(0, limit);
   const { rows } = await pool.query(`SELECT * FROM alerts ORDER BY created_at DESC LIMIT $1`, [Math.min(Math.max(n(limit), 1), 300)]);
   return rows.map(rowToAlert);
@@ -1772,7 +1792,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2258,10 +2278,10 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
     const alert = enriched.alert;
     const result = await insertAlert(alert);
-    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
-    // v047: 원문 overrideText를 넘기면 평균/최저 없는 원문이 그대로 재전송될 수 있어 넘기지 않는다.
+    // v056: 텔레그램 체감속도 우선. 푸시보다 텔레그램을 먼저 보낸다.
     const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
-    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, push, telegram });
+    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
+    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
@@ -2274,9 +2294,10 @@ app.post('/ingest', async (req, res) => {
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
     const alert = enriched.alert;
     const result = await insertAlert(alert);
-    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
+    // v056: 텔레그램 체감속도 우선. 푸시보다 텔레그램을 먼저 보낸다.
     const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
-    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, push, telegram });
+    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
+    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
