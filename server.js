@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v054-floodguard-manual-bigdeal-force';
+const SERVER_VERSION = 'v055-manual-option-dedupe-canonical';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 8);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 120000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 3500);
@@ -158,7 +158,10 @@ function productKeyTextVariantsFromTitle(title = '') {
 function dedupeKey(a) {
   const product = [s(a.productId, 80), s(a.itemId, 80), s(a.vendorItemId, 80)].filter(Boolean).join('|');
   const titleKey = normKey(stripDeliveryBadgeForKey(cleanTitleText(a.title || '')));
-  const opt = normKey(stripDeliveryBadgeForKey(cleanOptionText(a.option || a.optionKey || '')));
+  // [서버] v055:
+  // alert dedupe도 observation/stats와 같은 canonical option key를 쓴다.
+  // 예: "1개, 850g" / "850g, 1개"가 서로 다른 알림키로 갈라지는 문제 차단.
+  const opt = normalizeOptionForKey(a.option || a.optionKey || '');
   const price = n(a.price || a.payPrice);
   if (product) return `PID:${product}:OPT:${opt}:PRICE:${price}`;
   // v023: 텔레그램 재가공/직접전송은 공백·이모지·문장부호가 조금씩 달라져도 같은 상품/옵션/가격이면 중복으로 본다.
@@ -2223,8 +2226,13 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
     vendorItemId: obs.vendorItemId || alert.vendorItemId
   });
 
-  // 기존 PC/키위 수동 재요청 dedupeKey가 있으면 보존한다. 단, 없으면 기존 alert 기준 유지.
-  enriched.dedupeKey = alert.dedupeKey || enriched.dedupeKey;
+  // [서버] v055:
+  // normalizeAlert()가 내부에서 자동 생성한 예전 dedupeKey는 옵션 순서가 반영되어
+  // "1개, 850g" / "850g, 1개"가 갈라질 수 있었다.
+  // 사용자가/클라이언트가 명시적으로 보낸 dedupeKey만 보존하고,
+  // 명시값이 없으면 normalizeObservation()이 만든 canonical productKey+optionKey 기준으로 통일한다.
+  const explicitDedupeKey = s(alert.raw?.dedupeKey || alert.raw?.raw?.dedupeKey || '', 240);
+  enriched.dedupeKey = explicitDedupeKey || alertDedupeFromObservation(obs) || enriched.dedupeKey;
   enriched.raw = {
     ...(alert.raw || {}),
     observation: obs,
