@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v064-db-timeout-indexed-fast-stats';
+const SERVER_VERSION = 'v065-perf-timing-diagnose';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -38,6 +38,9 @@ const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS || 60 * 1000); 
 const STATS_ENABLE_TITLE_ILIKE = String(process.env.STATS_ENABLE_TITLE_ILIKE || 'false').toLowerCase() === 'true'; // v062: 느린 title ILIKE 기본 비활성화
 const DAILY_SAVE_ENABLE_TITLE_ILIKE = String(process.env.DAILY_SAVE_ENABLE_TITLE_ILIKE || 'false').toLowerCase() === 'true'; // v064: 일일 저장정책의 느린 title ILIKE도 기본 비활성화
 const STATS_SMART_SCAN_ENABLE = String(process.env.STATS_SMART_SCAN_ENABLE || 'false').toLowerCase() === 'true'; // v064: 5000-row JS smart scan 기본 비활성화, exact aggregate 우선
+const PERF_LOG_ENABLED = String(process.env.PERF_LOG_ENABLED || 'true').toLowerCase() !== 'false'; // v065: 느린 요청 단계별 시간 로그
+const PERF_SLOW_MS = Number(process.env.PERF_SLOW_MS || 3000);
+const PERF_DEBUG_RESPONSE = String(process.env.PERF_DEBUG_RESPONSE || 'true').toLowerCase() !== 'false';
 
 
 app.use(cors());
@@ -214,6 +217,28 @@ function id(prefix) { return `${prefix}_${Date.now()}_${crypto.randomBytes(4).to
 function s(v, max = 500) { return String(v ?? '').trim().slice(0, max); }
 function n(v) { const x = Number(v || 0); return Number.isFinite(x) ? Math.round(x) : 0; }
 function f(v) { const x = Number(v || 0); return Number.isFinite(x) ? x : 0; }
+
+function makePerf(label, meta = {}) {
+  const t0 = Date.now();
+  let last = t0;
+  const steps = [];
+  return {
+    step(name, extra = {}) {
+      const ts = Date.now();
+      steps.push({ name, ms: ts - last, atMs: ts - t0, ...extra });
+      last = ts;
+    },
+    done(extra = {}) {
+      const totalMs = Date.now() - t0;
+      const out = { label, totalMs, steps, ...extra };
+      if (PERF_LOG_ENABLED && totalMs >= PERF_SLOW_MS) {
+        const line = steps.map(x => `${x.name}=${x.ms}ms@${x.atMs}`).join(' | ');
+        console.warn(`[perf:${label}] total=${totalMs}ms ${line}`, JSON.stringify({ ...meta, ...extra }).slice(0, 1400));
+      }
+      return out;
+    }
+  };
+}
 
 
 // [서버] v060: 폴센트/에뮬에서 잠근 상품명·옵션·가격은 최종 발송 기준값이다.
@@ -1294,27 +1319,38 @@ async function serverDailySavePolicy(obs) {
 }
 
 async function insertObservation(obs, req) {
+  const perf = makePerf('insertObservation', { title: obs?.title, option: obs?.option, price: obs?.price });
   await pruneOldDataThrottled();
+  perf.step('prune');
   await touchWorker(obs, req);
+  perf.step('touchWorker');
 
   const policy = await serverDailySavePolicy(obs);
+  perf.step('dailySavePolicy', { policy: policy?.reason });
   if (!policy.allow) {
-    return { inserted: false, observation: obs, skipped: true, reason: policy.reason, policy };
+    const timing = perf.done({ inserted: false, reason: policy.reason });
+    return { inserted: false, observation: obs, skipped: true, reason: policy.reason, policy, timing };
   }
 
   if (!pool) {
     const exists = memory.observations.find(x => x.obsKey === obs.obsKey);
-    if (exists) return { inserted: false, observation: exists, skipped: true, reason: 'OBS_KEY_DUPLICATE', policy };
+    if (exists) {
+      const timing = perf.done({ inserted: false, reason: 'OBS_KEY_DUPLICATE' });
+      return { inserted: false, observation: exists, skipped: true, reason: 'OBS_KEY_DUPLICATE', policy, timing };
+    }
     memory.observations.unshift(obs);
     memory.observations = memory.observations.slice(0, 200000);
-    return { inserted: true, observation: obs, reason: policy.reason, policy };
+    const timing = perf.done({ inserted: true, reason: policy.reason, memory: true });
+    return { inserted: true, observation: obs, reason: policy.reason, policy, timing };
   }
   const r = await pool.query(`INSERT INTO price_observations (
     id,obs_key,product_key,title,title_key,option_text,option_key,price,card_discount_pct,card_text,url,partner_url,product_id,item_id,vendor_item_id,category,worker_id,source,raw,collected_at,created_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
   ON CONFLICT (obs_key) DO NOTHING RETURNING id`,
   [obs.id, obs.obsKey, obs.productKey, obs.title, obs.titleKey, obs.option, obs.optionKey, obs.price, obs.cardDiscountPct, obs.cardText, obs.url, obs.partnerUrl, obs.productId, obs.itemId, obs.vendorItemId, obs.category, obs.workerId, obs.source, JSON.stringify(obs.raw), obs.collectedAt, obs.createdAt]);
-  return { inserted: r.rowCount > 0, observation: obs, skipped: r.rowCount <= 0, reason: r.rowCount > 0 ? policy.reason : 'OBS_KEY_DUPLICATE', policy };
+  perf.step('insertPriceObservation', { rowCount: r.rowCount });
+  const timing = perf.done({ inserted: r.rowCount > 0, reason: r.rowCount > 0 ? policy.reason : 'OBS_KEY_DUPLICATE' });
+  return { inserted: r.rowCount > 0, observation: obs, skipped: r.rowCount <= 0, reason: r.rowCount > 0 ? policy.reason : 'OBS_KEY_DUPLICATE', policy, timing };
 }
 
 function uniqueStrings(list) {
@@ -1906,20 +1942,27 @@ async function getObservationStats(obs) {
 }
 
 async function getObservationStatsSafe(obs, ms = STATS_TIMEOUT_MS) {
+  const perf = makePerf('getObservationStatsSafe', { title: obs?.title, option: obs?.option, price: obs?.price, timeoutMs: ms });
   const cached = getCachedObservationStats(obs);
   if (cached) {
-    try { return applyClientFallbackStats(cached, obs?.raw || {}, n(obs?.price)); }
-    catch { return cached; }
+    perf.step('memoryCacheHit', { match: cached.match, count: n(cached.count) });
+    const timing = perf.done({ cached: true, match: cached.match, count: n(cached.count) });
+    try { return { ...applyClientFallbackStats(cached, obs?.raw || {}, n(obs?.price)), timing }; }
+    catch { return { ...cached, timing }; }
   }
   try {
     const stats = await withTimeout(getObservationStats(obs), ms, 'STATS_TIMEOUT');
+    perf.step('getObservationStats', { match: stats?.match, count: n(stats?.count), avg: n(stats?.avg), low: n(stats?.low) });
     setCachedObservationStats(obs, stats);
-    return stats;
+    const timing = perf.done({ timeout: false, match: stats?.match, count: n(stats?.count), avg: n(stats?.avg), low: n(stats?.low) });
+    return { ...stats, timing };
   } catch (e) {
     timedOutStatsRequests += 1;
+    perf.step('statsTimeout', { error: String(e?.message || e) });
     const fallback = emptyStatsFallback(obs, String(e?.message || e || 'stats_timeout').toLowerCase());
     setCachedObservationStats(obs, fallback);
-    return fallback;
+    const timing = perf.done({ timeout: true, match: fallback.match, error: String(e?.message || e) });
+    return { ...fallback, timing };
   }
 }
 
@@ -2020,7 +2063,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V064_20260702_DB_TIMEOUT_INDEXED_FAST_STATS', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V065_20260702_PERF_TIMING_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2187,34 +2230,43 @@ app.post('/collector/observe-batch', async (req, res) => {
 });
 
 app.post('/collector/observe', async (req, res) => {
+  const perf = makePerf('/collector/observe');
   try {
     if (!allowCollector(req, res)) return;
     const body = req.body || {};
     const obs = normalizeObservation(body);
+    perf.step('normalizeObservation');
     const obsResult = await insertObservation(obs, req);
+    perf.step('insertObservation', { obsReason: obsResult?.reason, obsInserted: !!obsResult?.inserted, obsTiming: obsResult?.timing });
     const silentCollector = !!(body?.muteAlert || body?.noAlert || body?.silent || body?.noTelegram || body?.collectorOnly);
     const stats = (silentCollector && SKIP_SILENT_OBSERVE_STATS)
       ? emptyStatsFallback(obs, 'silent_observe_stats_skipped')
       : await getObservationStatsSafe(obs, OBSERVE_STATS_TIMEOUT_MS);
+    perf.step('getObservationStatsSafe', { match: stats?.match, count: n(stats?.count), avg: n(stats?.avg), low: n(stats?.low), statsTiming: stats?.timing });
     const decision = silentCollector
       ? { create: false, reason: 'collector_only_mute_alert' }
       : shouldCreateAlertFromObservation(obs, stats);
+    perf.step('decision', { reason: decision?.reason, create: !!decision?.create });
     let alertResult = { created: false, duplicate: false, reason: decision.reason };
     let push = { sent: 0, skipped: true };
     let telegram = { sent: false, skipped: true };
     if (decision.create) {
       const alert = alertFromObservation(obs, stats, decision);
       const inserted = await insertAlert(alert);
+      perf.step('insertAlert', { inserted: !!inserted?.inserted });
       alertResult = { created: inserted.inserted, duplicate: !inserted.inserted, alert: inserted.alert };
       if (inserted.inserted) {
         const sent = await sendTelegramPushForResponse(alert);
+        perf.step('sendTelegramPushForResponse');
         telegram = sent.telegram;
         push = sent.push;
       }
     }
-    res.json({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, observation: obs, stats, decision, alert: alertResult, push, telegram });
+    const timing = perf.done({ title: obs.title, price: obs.price, match: stats?.match, decision: decision?.reason });
+    res.json({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, observation: obs, stats, decision, alert: alertResult, push, telegram, timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   } catch (e) {
-    res.status(400).json({ ok: false, error: String(e.message || e) });
+    const timing = perf.done({ error: String(e.message || e) });
+    res.status(400).json({ ok: false, error: String(e.message || e), timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   }
 });
 
@@ -2376,6 +2428,7 @@ function isStatsEnrichableTelegramAlert(alert = {}) {
 }
 
 async function enrichTelegramAlertWithServerStats(alert, req) {
+  const perf = makePerf('enrichTelegramAlertWithServerStats', { title: alert?.title, option: alert?.option, price: alert?.price, source: alert?.source });
   // v047: kiwi_telegram_manual_reply / telegram ingest가 바로 alerts를 만들면
   // 서버 DB·에뮬 통계 캐시를 타지 않아 평균/최저가 빠졌다.
   // 여기서만 collector 관측 흐름과 같은 stats 조회를 태우고, 템플릿은 서버가 다시 렌더한다.
@@ -2412,14 +2465,17 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
   };
 
   const obs = normalizeObservation(obsInput);
+  perf.step('normalizeObservation');
   let obsResult = { inserted: false, reason: 'not_attempted' };
   try {
     obsResult = await insertObservation(obs, req);
   } catch (e) {
     obsResult = { inserted: false, reason: 'insert_observation_failed', error: String(e.message || e) };
   }
+  perf.step('insertObservation', { obsReason: obsResult?.reason, obsInserted: !!obsResult?.inserted, obsTiming: obsResult?.timing });
 
   const serverStats = await getObservationStatsSafe(obs);
+  perf.step('getObservationStatsSafe', { match: serverStats?.match, count: n(serverStats?.count), avg: n(serverStats?.avg), low: n(serverStats?.low), statsTiming: serverStats?.timing });
   const textAvg = n(alert.avg);
   const textLow = n(alert.low);
   const textDrop = f(alert.dropPct || (textAvg > 0 && obs.price > 0 ? ((textAvg - obs.price) / textAvg) * 100 : 0));
@@ -2493,6 +2549,7 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
   // 명시값이 없으면 normalizeObservation()이 만든 canonical productKey+optionKey 기준으로 통일한다.
   const explicitDedupeKey = s(alert.raw?.dedupeKey || alert.raw?.raw?.dedupeKey || '', 240);
   enriched.dedupeKey = explicitDedupeKey || alertDedupeFromObservation(obs) || enriched.dedupeKey;
+  const timing = perf.done({ match: stats?.match, count: n(stats?.count), avg: n(stats?.avg), low: n(stats?.low), decision: decision?.reason });
   enriched.raw = {
     ...(alert.raw || {}),
     observation: obs,
@@ -2500,12 +2557,14 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
     decision,
     obsResult,
     telegramIngestStatsEnriched: true,
-    originalAlert: alert
+    originalAlert: alert,
+    timing
   };
-  return { alert: enriched, enriched: true, obs, stats, decision, obsResult };
+  return { alert: enriched, enriched: true, obs, stats, decision, obsResult, timing };
 }
 
 app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
+  const perf = makePerf('/telegram/ingest');
   try {
     if (!allowIngest(req, res)) return;
     const body = req.body || {};
@@ -2515,33 +2574,46 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
       body.sourceText || body.inputText || body.originalMessage || body.originalMessageText ||
       rawObj.telegramText || rawObj.telegramReply || rawObj.originalText || rawObj.rawText || rawObj.fullText || '';
     const parsed = text ? parseTelegramText(text, { ...body, text }) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
+    perf.step('parse', { title: parsed?.title, price: parsed?.price });
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
+    perf.step('enrichTelegramAlertWithServerStats', { enriched: !!enriched?.enriched, enrichTiming: enriched?.timing });
     const alert = enriched.alert;
     const result = await insertAlert(alert);
+    perf.step('insertAlert', { inserted: !!result?.inserted });
     // v061: 응답 지연 방지. 텔레그램/푸시는 백그라운드 전송하고 HTTP 응답은 즉시 반환한다.
     const sent = result.inserted ? await sendTelegramPushForResponse(alert) : { telegram: { sent: false, duplicate: true }, push: { sent: 0, duplicate: true } };
+    perf.step('sendTelegramPushForResponse');
     const telegram = sent.telegram;
     const push = sent.push;
-    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
+    const timing = perf.done({ title: alert?.title, price: alert?.price, inserted: !!result?.inserted, match: enriched?.stats?.match });
+    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push, timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   } catch (e) {
-    res.status(400).json({ ok: false, error: String(e.message || e) });
+    const timing = perf.done({ error: String(e.message || e) });
+    res.status(400).json({ ok: false, error: String(e.message || e), timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   }
 });
 
 app.post('/ingest', async (req, res) => {
+  const perf = makePerf('/ingest');
   try {
     if (!allowIngest(req, res)) return;
     const parsed = normalizeAlert(req.body || {});
+    perf.step('normalizeAlert', { title: parsed?.title, price: parsed?.price });
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
+    perf.step('enrichTelegramAlertWithServerStats', { enriched: !!enriched?.enriched, enrichTiming: enriched?.timing });
     const alert = enriched.alert;
     const result = await insertAlert(alert);
+    perf.step('insertAlert', { inserted: !!result?.inserted });
     // v061: 응답 지연 방지. 텔레그램/푸시는 백그라운드 전송하고 HTTP 응답은 즉시 반환한다.
     const sent = result.inserted ? await sendTelegramPushForResponse(alert) : { telegram: { sent: false, duplicate: true }, push: { sent: 0, duplicate: true } };
+    perf.step('sendTelegramPushForResponse');
     const telegram = sent.telegram;
     const push = sent.push;
-    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
+    const timing = perf.done({ title: alert?.title, price: alert?.price, inserted: !!result?.inserted, match: enriched?.stats?.match });
+    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push, timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   } catch (e) {
-    res.status(400).json({ ok: false, error: String(e.message || e) });
+    const timing = perf.done({ error: String(e.message || e) });
+    res.status(400).json({ ok: false, error: String(e.message || e), timing: PERF_DEBUG_RESPONSE ? timing : undefined });
   }
 });
 
