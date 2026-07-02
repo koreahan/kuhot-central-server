@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v063-delivery-badge-preserved-fast-cache';
+const SERVER_VERSION = 'v064-db-timeout-indexed-fast-stats';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -36,6 +36,8 @@ const SKIP_SILENT_OBSERVE_STATS = String(process.env.SKIP_SILENT_OBSERVE_STATS |
 const OBSERVE_STATS_TIMEOUT_MS = Number(process.env.OBSERVE_STATS_TIMEOUT_MS || STATS_TIMEOUT_MS);
 const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS || 60 * 1000); // v062: 평균/최저 조회 결과 60초 메모리 캐시
 const STATS_ENABLE_TITLE_ILIKE = String(process.env.STATS_ENABLE_TITLE_ILIKE || 'false').toLowerCase() === 'true'; // v062: 느린 title ILIKE 기본 비활성화
+const DAILY_SAVE_ENABLE_TITLE_ILIKE = String(process.env.DAILY_SAVE_ENABLE_TITLE_ILIKE || 'false').toLowerCase() === 'true'; // v064: 일일 저장정책의 느린 title ILIKE도 기본 비활성화
+const STATS_SMART_SCAN_ENABLE = String(process.env.STATS_SMART_SCAN_ENABLE || 'false').toLowerCase() === 'true'; // v064: 5000-row JS smart scan 기본 비활성화, exact aggregate 우선
 
 
 app.use(cors());
@@ -989,6 +991,10 @@ async function initDb() {
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time ON price_observations(product_key, option_key, collected_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_created_at ON price_observations(created_at DESC)`);
+  // v064: 평균/최저/일일저장 정책용 빠른 exact index. title ILIKE 대량검색 대신 이 인덱스를 우선 사용한다.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time_price ON price_observations(product_key, option_key, collected_at DESC) WHERE price > 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_title_option_time_price ON price_observations(title_key, option_key, collected_at DESC) WHERE price > 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_collected_time_price ON price_observations(collected_at DESC) WHERE price > 0`);
   await pool.query(`CREATE TABLE IF NOT EXISTS emul_price_stats (
     id TEXT PRIMARY KEY,
     stat_key TEXT UNIQUE NOT NULL,
@@ -1011,6 +1017,8 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option ON emul_price_stats(product_key, option_key, updated_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option ON emul_price_stats(title_key, option_key, updated_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_last_seen ON emul_price_stats(last_seen_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option_seen ON emul_price_stats(product_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option_seen ON emul_price_stats(title_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`);
   await pool.query(`CREATE TABLE IF NOT EXISTS collector_workers (
     worker_id TEXT PRIMARY KEY,
     name TEXT,
@@ -1256,7 +1264,7 @@ async function serverDailySavePolicy(obs) {
   } else {
     const params = [day.start, day.end, variants, wantedTitleKey];
     let where = `collected_at >= $1 AND collected_at < $2 AND price > 0 AND (product_key = ANY($3::text[]) OR title_key = $4`;
-    if (wanted.title && wanted.title.length >= 2) {
+    if (DAILY_SAVE_ENABLE_TITLE_ILIKE && wanted.title && wanted.title.length >= 2) {
       params.push(`%${wanted.title}%`);
       where += ` OR title ILIKE $5`;
     }
@@ -1827,31 +1835,33 @@ async function getObservationStats(obs) {
     }
   }
 
-  const params = [cutoff, variants, wantedTitleKey || ''];
-  let where = `collected_at >= $1 AND price > 0 AND (product_key = ANY($2::text[]) OR title_key = $3`;
-  if (STATS_ENABLE_TITLE_ILIKE && wanted.title && wanted.title.length >= 2) {
-    params.push(`%${wanted.title}%`);
-    where += ` OR title ILIKE $4`;
-  }
-  where += `)`;
+  // v064: 기존 smart scan은 후보 5000행을 읽어 JS에서 필터링해서 Render/Postgres에서 timeout이 잦았다.
+  // 기본은 index-friendly exact aggregate로 바로 내려가고, 꼭 필요할 때만 STATS_SMART_SCAN_ENABLE=true로 켠다.
+  if (STATS_SMART_SCAN_ENABLE) {
+    const params = [cutoff, variants, wantedTitleKey || ''];
+    let where = `collected_at >= $1 AND price > 0 AND (product_key = ANY($2::text[]) OR title_key = $3`;
+    if (STATS_ENABLE_TITLE_ILIKE && wanted.title && wanted.title.length >= 2) {
+      params.push(`%${wanted.title}%`);
+      where += ` OR title ILIKE $4`;
+    }
+    where += `)`;
 
-  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source, raw
-    FROM price_observations
-    WHERE ${where}
-    ORDER BY collected_at DESC
-    LIMIT 5000`, params);
+    const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source, raw
+      FROM price_observations
+      WHERE ${where}
+      ORDER BY collected_at DESC
+      LIMIT 5000`, params);
 
-  const matched = rows.filter(rowMatches);
+    const matched = rows.filter(rowMatches);
 
-  if (matched.length) {
-    {
+    if (matched.length) {
       const baseStats = summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants, n(obs.price));
       const emulStats = await applyEmulServerStatsCache(baseStats, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
       return applyClientFallbackStats(emulStats, obs.raw, n(obs.price));
     }
   }
 
-  // 마지막 방어: 기존 정확매칭 방식. smart 매칭 실패 시에만 사용한다.
+  // v064 기본 경로: 정확 product/title key + option key aggregate. 평균/최저 기능은 유지하되 DB 반환량을 크게 줄인다.
   async function queryByProductKeys(keys, optionKey) {
     if (!keys.length) return { count: 0, avg: 0, low: 0, high: 0 };
     const { rows } = await pool.query(`SELECT COUNT(*)::int AS count, ROUND(AVG(price))::int AS avg, MIN(price)::int AS low, MAX(price)::int AS high
@@ -2010,7 +2020,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V063_20260701_DELIVERY_BADGE_PRESERVED', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, deliveryBadgePreserved: true, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V064_20260702_DB_TIMEOUT_INDEXED_FAST_STATS', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
