@@ -10,11 +10,11 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v059-redeploy-marker-fast-timeout';
+const SERVER_VERSION = 'v063-delivery-badge-preserved-fast-cache';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
-const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 3500);
-const DB_CONNECT_TIMEOUT_MS = Number(process.env.DB_CONNECT_TIMEOUT_MS || 2500);
+const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
+const DB_CONNECT_TIMEOUT_MS = Number(process.env.DB_CONNECT_TIMEOUT_MS || 1500);
 const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 1500);
 const OBSERVE_BATCH_LIMIT = Number(process.env.OBSERVE_BATCH_LIMIT || 120);
 const EMUL_STATS_BATCH_LIMIT = Number(process.env.EMUL_STATS_BATCH_LIMIT || 120);
@@ -31,6 +31,11 @@ const MIN_HISTORY_COUNT = Number(process.env.MIN_HISTORY_COUNT || 2);
 const COUPANG_PARTNERS_ACCESS_KEY = process.env.COUPANG_PARTNERS_ACCESS_KEY || process.env.CP_ACCESS_KEY || '';
 const COUPANG_PARTNERS_SECRET_KEY = process.env.COUPANG_PARTNERS_SECRET_KEY || process.env.CP_SECRET_KEY || '';
 const COUPANG_PARTNERS_SUB_ID = process.env.COUPANG_PARTNERS_SUB_ID || process.env.CP_SUB_ID || '';
+const FAST_NOTIFY_RESPONSE = String(process.env.FAST_NOTIFY_RESPONSE || 'true').toLowerCase() !== 'false'; // v061: 텔레그램/푸시는 백그라운드로 보내고 응답은 먼저 반환
+const SKIP_SILENT_OBSERVE_STATS = String(process.env.SKIP_SILENT_OBSERVE_STATS || 'false').toLowerCase() === 'true'; // v062: 평균/최저 보존 기본값. true로 넣은 경우에만 무알림 관측 stats 생략
+const OBSERVE_STATS_TIMEOUT_MS = Number(process.env.OBSERVE_STATS_TIMEOUT_MS || STATS_TIMEOUT_MS);
+const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS || 60 * 1000); // v062: 평균/최저 조회 결과 60초 메모리 캐시
+const STATS_ENABLE_TITLE_ILIKE = String(process.env.STATS_ENABLE_TITLE_ILIKE || 'false').toLowerCase() === 'true'; // v062: 느린 title ILIKE 기본 비활성화
 
 
 app.use(cors());
@@ -80,6 +85,54 @@ async function withTimeout(promise, ms, label = 'TIMEOUT') {
   return Promise.race([promise, timeoutPromise(ms, label)]);
 }
 
+let backgroundTelegramQueued = 0;
+let backgroundTelegramSent = 0;
+let backgroundTelegramFailed = 0;
+let backgroundPushQueued = 0;
+let backgroundPushSent = 0;
+let backgroundPushFailed = 0;
+
+function runBackground(label, fn) {
+  setImmediate(async () => {
+    try { await fn(); }
+    catch (e) { console.warn(`[background:${label}] failed`, String(e?.message || e)); }
+  });
+}
+
+function dispatchTelegramPush(alert) {
+  if (!alert) return { telegram: { queued: false, skipped: true }, push: { queued: false, skipped: true } };
+  backgroundTelegramQueued += 1;
+  backgroundPushQueued += 1;
+  runBackground('telegram', async () => {
+    try {
+      const r = await sendTelegram(alert);
+      if (r?.sent) backgroundTelegramSent += 1;
+      else backgroundTelegramFailed += 1;
+    } catch (e) {
+      backgroundTelegramFailed += 1;
+      console.warn('[telegram-bg] failed', String(e?.message || e));
+    }
+  });
+  runBackground('push', async () => {
+    try {
+      const r = await sendPush(alert);
+      backgroundPushSent += n(r?.sent || 0);
+    } catch (e) {
+      backgroundPushFailed += 1;
+      console.warn('[push-bg] failed', String(e?.message || e));
+    }
+  });
+  return { telegram: { queued: true, background: true }, push: { queued: true, background: true } };
+}
+
+async function sendTelegramPushForResponse(alert) {
+  if (!alert) return { telegram: { sent: false, skipped: true }, push: { sent: 0, skipped: true } };
+  if (FAST_NOTIFY_RESPONSE) return dispatchTelegramPush(alert);
+  const telegram = await sendTelegram(alert);
+  const push = await sendPush(alert);
+  return { telegram, push };
+}
+
 function emptyStatsFallback(obs, reason = 'stats_timeout') {
   const cutoff = Date.now() - PRICE_RETENTION_MS;
   const variants = (() => { try { return productKeyLookupVariants(obs); } catch { return []; } })();
@@ -100,9 +153,44 @@ function emptyStatsFallback(obs, reason = 'stats_timeout') {
   catch { return base; }
 }
 
+function statsCacheKeyForObservation(obs = {}) {
+  const wanted = (() => { try { return looseIdentityFromParts(obs.title, obs.option); } catch { return {}; } })();
+  const titleKey = wanted.titleKey || obs.titleKey || normKey(obs.title || '');
+  const optionKey = wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || '');
+  return `${obs.productKey || ''}|${titleKey || ''}|${optionKey || ''}`;
+}
+
+function getCachedObservationStats(obs) {
+  if (!STATS_CACHE_TTL_MS || STATS_CACHE_TTL_MS <= 0) return null;
+  const key = statsCacheKeyForObservation(obs);
+  const hit = statsMemoryCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - n(hit.cachedAt) > STATS_CACHE_TTL_MS) {
+    statsMemoryCache.delete(key);
+    return null;
+  }
+  return {
+    ...hit.stats,
+    fromMemoryCache: true,
+    match: `${hit.stats?.match || 'stats'}_memory_cache`
+  };
+}
+
+function setCachedObservationStats(obs, stats) {
+  if (!STATS_CACHE_TTL_MS || STATS_CACHE_TTL_MS <= 0) return;
+  if (!stats || n(stats.avg) <= 0 || n(stats.count) <= 0) return;
+  const key = statsCacheKeyForObservation(obs);
+  statsMemoryCache.set(key, { cachedAt: Date.now(), stats: { ...stats } });
+  if (statsMemoryCache.size > 2000) {
+    const firstKey = statsMemoryCache.keys().next().value;
+    if (firstKey) statsMemoryCache.delete(firstKey);
+  }
+}
+
 
 let pool = null;
 const memory = { devices: new Map(), alerts: [], opens: [], observations: [], emulStats: [] };
+const statsMemoryCache = new Map();
 let lastPruneAt = 0;
 let lastPruneResult = null;
 let pruneInFlight = null;
@@ -124,6 +212,62 @@ function id(prefix) { return `${prefix}_${Date.now()}_${crypto.randomBytes(4).to
 function s(v, max = 500) { return String(v ?? '').trim().slice(0, max); }
 function n(v) { const x = Number(v || 0); return Number.isFinite(x) ? Math.round(x) : 0; }
 function f(v) { const x = Number(v || 0); return Number.isFinite(x) ? x : 0; }
+
+
+// [서버] v060: 폴센트/에뮬에서 잠근 상품명·옵션·가격은 최종 발송 기준값이다.
+// 쿠팡/PC 상세 파싱값은 링크 검증용으로만 쓰고, price/finalPrice/payPrice로 덮어쓰지 않는다.
+function truthy(v) {
+  return v === true || String(v ?? '').trim().toLowerCase() === 'true' || String(v ?? '').trim() === '1';
+}
+
+function isFallcentLockedPayload(body = {}) {
+  const raw = body && typeof body.raw === 'object' ? body.raw : {};
+  const nested = raw && typeof raw.raw === 'object' ? raw.raw : {};
+  const vals = [
+    body.priceSource, raw.priceSource, nested.priceSource,
+    body.lockedBy, raw.lockedBy, nested.lockedBy,
+    body.source, raw.source, nested.source,
+    body.workerId, raw.workerId, nested.workerId,
+    body.from, raw.from, nested.from
+  ].map(v => String(v ?? '').trim().toLowerCase());
+
+  return Boolean(
+    truthy(body.noCoupangPriceOverride) || truthy(raw.noCoupangPriceOverride) || truthy(nested.noCoupangPriceOverride) ||
+    truthy(body.linkOnlyVerified) || truthy(raw.linkOnlyVerified) || truthy(nested.linkOnlyVerified) ||
+    vals.some(v => v.includes('fallcent') || v.includes('hotdeal_app') || v.includes('emulator_hotdeal') || v.includes('emu_hotdeal'))
+  );
+}
+
+function lockedFallcentPrice(body = {}) {
+  const raw = body && typeof body.raw === 'object' ? body.raw : {};
+  const nested = raw && typeof raw.raw === 'object' ? raw.raw : {};
+  const candidates = [
+    body.lockedPrice, body.fallcentPrice, body.fallcentLockedPrice, body.hotdealAppPrice, body.appLockedPrice,
+    raw.lockedPrice, raw.fallcentPrice, raw.fallcentLockedPrice, raw.hotdealAppPrice, raw.appLockedPrice,
+    nested.lockedPrice, nested.fallcentPrice, nested.fallcentLockedPrice, nested.hotdealAppPrice, nested.appLockedPrice
+  ];
+  for (const v of candidates) {
+    const p = n(v);
+    if (p > 0) return p;
+  }
+  if (isFallcentLockedPayload(body)) {
+    const p = n(body.price || raw.price || nested.price);
+    if (p > 0) return p;
+  }
+  return 0;
+}
+
+function alertPriceFromBody(body = {}) {
+  const locked = lockedFallcentPrice(body);
+  if (locked > 0) return locked;
+  return n(body.price || body.payPrice);
+}
+
+function observationPriceFromBody(body = {}) {
+  const locked = lockedFallcentPrice(body);
+  if (locked > 0) return locked;
+  return n(body.price || body.payPrice || body.finalPrice);
+}
 
 
 // [서버] v3.184: 로켓프레시/로켓직구/쿠팡직구는 템플릿 표시용 배지일 뿐,
@@ -173,7 +317,7 @@ function dedupeKey(a) {
 }
 
 function normalizeAlert(body) {
-  const price = n(body.price || body.payPrice);
+  const price = alertPriceFromBody(body);
   const avg = n(body.avg || body.avgPrice || body.baselineAvg);
   const title = cleanTitleText(body.title);
   const option = cleanOptionText(body.option || body.optionKey);
@@ -196,6 +340,9 @@ function normalizeAlert(body) {
     manualToolMode: s(body.manualToolMode, 40),
     cardText: cleanCardText(body.cardText || body.cardBestInfo, title, option),
     cardDiscountPct: f(body.cardDiscountPct || body.cardPct || body.cardRate || 0),
+    hasFresh: !!(body.hasFresh || body.isFresh || /로켓\s*프레시|rocket\s*fresh/i.test(String(body.deliveryBadge || body.badge || body.raw?.deliveryBadge || ''))),
+    hasJikgu: !!(body.hasJikgu || body.isJikgu || /로켓\s*직구|쿠팡\s*직구|rocket\s*global/i.test(String(body.deliveryBadge || body.badge || body.raw?.deliveryBadge || ''))),
+    deliveryBadge: deliveryBadgeForDisplay(body.deliveryBadge, body.badge, body, body.raw),
     // 구매 링크는 파트너스/제휴 링크를 최우선으로 저장합니다.
     url: s(body.partnerUrl || body.coupangPartnerUrl || body.affiliateUrl || body.shortUrl || body.deepLink || body.url || body.productUrl, 1000),
     originalUrl: s(body.originalUrl || body.productUrl || body.url, 1000),
@@ -293,7 +440,7 @@ function alertDedupeFromObservation(obs) {
 
 function normalizeObservation(body = {}) {
   const ids = canonicalProductIdentity(body);
-  const price = n(body.price || body.payPrice || body.finalPrice);
+  const price = observationPriceFromBody(body);
   const collectedAt = n(body.collectedAt) || now();
   const obs = {
     id: s(body.id) || id('obs'),
@@ -305,6 +452,9 @@ function normalizeObservation(body = {}) {
     price,
     cardDiscountPct: f(body.cardDiscountPct || body.cardPct || body.cardRate || 0),
     cardText: cleanCardText(body.cardText || body.cardBestInfo || body.cardInfo || '', ids.title, ids.option),
+    hasFresh: !!(body.hasFresh || body.isFresh || /로켓\s*프레시|rocket\s*fresh/i.test(String(body.deliveryBadge || body.badge || body.raw?.deliveryBadge || ''))),
+    hasJikgu: !!(body.hasJikgu || body.isJikgu || /로켓\s*직구|쿠팡\s*직구|rocket\s*global/i.test(String(body.deliveryBadge || body.badge || body.raw?.deliveryBadge || ''))),
+    deliveryBadge: deliveryBadgeForDisplay(body.deliveryBadge, body.badge, body, body.raw),
     url: s(body.url || body.productUrl || body.originalUrl || '', 1000),
     partnerUrl: s(body.partnerUrl || body.coupangPartnerUrl || body.affiliateUrl || body.shortUrl || body.deepLink || '', 1000),
     productId: ids.productId,
@@ -460,6 +610,34 @@ function isManualBigDealForced(obj = {}) {
   return vals.includes('true') || vals.includes('big') || vals.includes('bigdeal') || vals.includes('daebak') || vals.some(v => v.includes('대박'));
 }
 
+
+function deliveryBadgeForDisplay(...vals) {
+  const blob = vals
+    .flatMap(v => {
+      if (!v) return [];
+      if (typeof v === 'object') return [v.deliveryBadge, v.delivery_badge, v.badge, v.hasFresh ? '로켓프레시' : '', v.hasJikgu ? '로켓직구' : '', v.raw];
+      return [v];
+    })
+    .map(v => {
+      if (!v) return '';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    })
+    .join(' ')
+    .replace(/\s+/g, '');
+  if (/로켓프레시|rocketfresh/i.test(blob)) return ' [로켓프레시❄️]';
+  if (/로켓직구|쿠팡직구|rocketglobal/i.test(blob)) return ' [로켓직구🌏]';
+  return '';
+}
+
+function titleWithDisplayDeliveryBadge(title, badge) {
+  const clean = stripDeliveryBadgeForKey(title || '').trim() || s(title || '', 500).trim();
+  const b = String(badge || '').trim();
+  if (!b) return clean;
+  if (/로켓프레시|로켓직구|쿠팡직구/i.test(clean)) return clean;
+  return `${clean}${b}`.trim();
+}
+
 function dealGradeLine(dropPct, appPct = 0, price = 0) {
   const d = Math.max(Math.abs(f(dropPct)), Math.abs(f(appPct)));
   const bigNeed = bigDealThresholdForPrice(price);
@@ -477,7 +655,13 @@ function formatCollectorFullTemplate(a) {
   const stats = raw.stats || {};
   const decision = raw.decision || {};
   const rawTitleForDisplay = s(a.title || obs.title || '상품', 500);
-  const title = stripDeliveryBadgeForKey(rawTitleForDisplay) || rawTitleForDisplay;
+  const displayBadge = deliveryBadgeForDisplay(
+    a.deliveryBadge, a.badge, a.hasFresh ? '로켓프레시' : '', a.hasJikgu ? '로켓직구' : '',
+    raw.deliveryBadge, raw.badge, raw.hasFresh ? '로켓프레시' : '', raw.hasJikgu ? '로켓직구' : '',
+    obs.deliveryBadge, obs.badge, obs.hasFresh ? '로켓프레시' : '', obs.hasJikgu ? '로켓직구' : '',
+    obsRaw.deliveryBadge, obsRaw.badge, obsRaw.hasFresh ? '로켓프레시' : '', obsRaw.hasJikgu ? '로켓직구' : '', obsRaw.raw
+  );
+  const title = titleWithDisplayDeliveryBadge(rawTitleForDisplay, displayBadge);
   const option = s(a.option || obs.option || '', 300);
   const price = n(a.price || obs.price);
   const avg = n(a.avg || stats.avg);
@@ -488,9 +672,9 @@ function formatCollectorFullTemplate(a) {
   const avgDiff = avg > 0 && price > 0 ? Math.max(0, avg - price) : 0;
   const lowDiff = low > 0 && price > 0 ? Math.max(0, low - price) : 0;
   const url = s(a.url || a.partnerUrl || obs.partnerUrl || obs.url || '', 1000);
-  const hasFresh = !!(obsRaw.hasFresh || obsRaw.raw?.hasFresh);
-  const hasJikgu = !!(obsRaw.hasJikgu || obsRaw.raw?.hasJikgu);
-  const badge = hasFresh ? ' [로켓프레시❄️]' : (hasJikgu ? ' [로켓직구🌏]' : '');
+  // v063: 배송배지는 DB/중복키에서는 제거하지만 출력 템플릿에는 보존한다.
+  // title 변수에 이미 displayBadge를 붙였으므로 여기서는 추가하지 않는다.
+  const badge = '';
   const bigPriceLabelDrop = Math.max(Math.abs(f(avgDrop)), Math.abs(f(appFallbackPct)));
   const forcedBigDeal = isManualBigDealForced(a) || isManualBigDealForced(raw) || isManualBigDealForced(obsRaw);
   // v054: PC 대박툴 수동 클릭은 자동 할인율 계산보다 우선한다.
@@ -592,7 +776,7 @@ function parseTelegramText(text, body = {}) {
   const lowLine = lines.find(x => x.includes('최저')) || '';
   const url = s(body.partnerUrl || body.url || body.link || firstUrl(text), 1000);
   const cardLine = firstCardLine(text);
-  const price = n(body.price || firstWon(priceLine || titleLine));
+  const price = lockedFallcentPrice(body) || n(body.price || firstWon(priceLine || titleLine));
   const compact = splitCompactTitleOption(body.title || titleLine);
   const title = cleanTitleText(compact.title || body.message || '텔레그램 핫딜');
   const option = cleanOptionText(body.option || optionLine.replace(/^└\s*/, '') || compact.option);
@@ -1102,7 +1286,7 @@ async function serverDailySavePolicy(obs) {
 }
 
 async function insertObservation(obs, req) {
-  await pruneOldData();
+  await pruneOldDataThrottled();
   await touchWorker(obs, req);
 
   const policy = await serverDailySavePolicy(obs);
@@ -1528,7 +1712,7 @@ async function getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wa
 
   const params = [variants, wantedTitleKey || '', cutoff];
   let where = `(product_key = ANY($1::text[]) OR title_key = $2`;
-  if (wanted.title && wanted.title.length >= 2) {
+  if (STATS_ENABLE_TITLE_ILIKE && wanted.title && wanted.title.length >= 2) {
     params.push(`%${wanted.title}%`);
     where += ` OR title ILIKE $4`;
   }
@@ -1593,6 +1777,31 @@ async function getObservationStats(obs) {
     return { count: 0, avg: 0, low: 0, high: 0, cutoff, match: 'none', productKeyVariants: variants };
   }
 
+  // v062: 에뮬 통계 캐시가 있으면 느린 price_observations 대량 스캔 전에 먼저 사용한다.
+  // 평균/최저는 그대로 나오면서 반환 시간이 크게 줄어든다.
+  try {
+    const emulFast = await getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
+    if (emulFast && n(emulFast.count) > 0 && n(emulFast.avg) > 0) {
+      const fastStats = applyClientFallbackStats({
+        count: n(emulFast.count),
+        avg: n(emulFast.avg),
+        low: n(emulFast.low),
+        high: Math.max(n(emulFast.high), n(emulFast.avg)),
+        dbAvg: 0,
+        dbLow: 0,
+        dbHigh: 0,
+        emulStatsCache: emulFast,
+        avgSource: 'emulator_server_stats_cache_fast',
+        cutoff,
+        match: 'fast_emul_stats_cache',
+        productKeyVariants: variants
+      }, obs.raw, n(obs.price));
+      return fastStats;
+    }
+  } catch (e) {
+    console.warn('[stats-fast-emul-cache] skipped', String(e?.message || e));
+  }
+
   function rowMatches(row) {
     const rowId = looseIdentityFromRow(row);
     const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
@@ -1620,7 +1829,7 @@ async function getObservationStats(obs) {
 
   const params = [cutoff, variants, wantedTitleKey || ''];
   let where = `collected_at >= $1 AND price > 0 AND (product_key = ANY($2::text[]) OR title_key = $3`;
-  if (wanted.title && wanted.title.length >= 2) {
+  if (STATS_ENABLE_TITLE_ILIKE && wanted.title && wanted.title.length >= 2) {
     params.push(`%${wanted.title}%`);
     where += ` OR title ILIKE $4`;
   }
@@ -1687,11 +1896,20 @@ async function getObservationStats(obs) {
 }
 
 async function getObservationStatsSafe(obs, ms = STATS_TIMEOUT_MS) {
+  const cached = getCachedObservationStats(obs);
+  if (cached) {
+    try { return applyClientFallbackStats(cached, obs?.raw || {}, n(obs?.price)); }
+    catch { return cached; }
+  }
   try {
-    return await withTimeout(getObservationStats(obs), ms, 'STATS_TIMEOUT');
+    const stats = await withTimeout(getObservationStats(obs), ms, 'STATS_TIMEOUT');
+    setCachedObservationStats(obs, stats);
+    return stats;
   } catch (e) {
     timedOutStatsRequests += 1;
-    return emptyStatsFallback(obs, String(e?.message || e || 'stats_timeout').toLowerCase());
+    const fallback = emptyStatsFallback(obs, String(e?.message || e || 'stats_timeout').toLowerCase());
+    setCachedObservationStats(obs, fallback);
+    return fallback;
   }
 }
 
@@ -1792,7 +2010,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V059_20260701_FAST_TIMEOUT', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V063_20260701_DELIVERY_BADGE_PRESERVED', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, deliveryBadgePreserved: true, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1925,8 +2143,10 @@ app.post('/collector/observe-batch', async (req, res) => {
         const merged = { ...(req.body.common || {}), ...item };
         const obs = normalizeObservation(merged);
         const obsResult = await insertObservation(obs, req);
-        const stats = await getObservationStatsSafe(obs);
         const silentCollector = !!(merged?.muteAlert || merged?.noAlert || merged?.silent || merged?.noTelegram || merged?.collectorOnly || req.body?.common?.muteAlert || req.body?.common?.noTelegram);
+        const stats = (silentCollector && SKIP_SILENT_OBSERVE_STATS)
+          ? emptyStatsFallback(obs, 'silent_observe_stats_skipped')
+          : await getObservationStatsSafe(obs, OBSERVE_STATS_TIMEOUT_MS);
         const decision = silentCollector
           ? { create: false, reason: 'collector_only_mute_alert' }
           : shouldCreateAlertFromObservation(obs, stats);
@@ -1938,10 +2158,11 @@ app.post('/collector/observe-batch', async (req, res) => {
           const inserted = await insertAlert(alert);
           alertResult = { created: inserted.inserted, duplicate: !inserted.inserted, alert: inserted.alert };
           if (inserted.inserted) {
-            push = await sendPush(alert);
-            telegram = await sendTelegram(alert);
+            const sent = await sendTelegramPushForResponse(alert);
+            telegram = sent.telegram;
+            push = sent.push;
             alertsCreated += 1;
-            pushed += n(push.sent);
+            pushed += n(push.sent || 0);
           }
         }
         results.push({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, title: obs.title, option: obs.option, price: obs.price, stats, decision, alert: alertResult, push, telegram });
@@ -1958,10 +2179,13 @@ app.post('/collector/observe-batch', async (req, res) => {
 app.post('/collector/observe', async (req, res) => {
   try {
     if (!allowCollector(req, res)) return;
-    const obs = normalizeObservation(req.body || {});
+    const body = req.body || {};
+    const obs = normalizeObservation(body);
     const obsResult = await insertObservation(obs, req);
-    const stats = await getObservationStatsSafe(obs);
-    const silentCollector = !!(req.body?.muteAlert || req.body?.noAlert || req.body?.silent || req.body?.noTelegram || req.body?.collectorOnly);
+    const silentCollector = !!(body?.muteAlert || body?.noAlert || body?.silent || body?.noTelegram || body?.collectorOnly);
+    const stats = (silentCollector && SKIP_SILENT_OBSERVE_STATS)
+      ? emptyStatsFallback(obs, 'silent_observe_stats_skipped')
+      : await getObservationStatsSafe(obs, OBSERVE_STATS_TIMEOUT_MS);
     const decision = silentCollector
       ? { create: false, reason: 'collector_only_mute_alert' }
       : shouldCreateAlertFromObservation(obs, stats);
@@ -1973,8 +2197,9 @@ app.post('/collector/observe', async (req, res) => {
       const inserted = await insertAlert(alert);
       alertResult = { created: inserted.inserted, duplicate: !inserted.inserted, alert: inserted.alert };
       if (inserted.inserted) {
-        push = await sendPush(alert);
-        telegram = await sendTelegram(alert);
+        const sent = await sendTelegramPushForResponse(alert);
+        telegram = sent.telegram;
+        push = sent.push;
       }
     }
     res.json({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, observation: obs, stats, decision, alert: alertResult, push, telegram });
@@ -2152,6 +2377,11 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
     title: alert.title,
     option: alert.option,
     price: alert.price,
+    lockedPrice: lockedFallcentPrice(alert.raw || {}) || alert.price,
+    fallcentPrice: lockedFallcentPrice(alert.raw || {}) || alert.price,
+    priceSource: (alert.raw && (alert.raw.priceSource || alert.raw.lockedBy || alert.raw.source)) || (isFallcentLockedPayload(alert.raw || {}) ? 'fallcent_locked' : ''),
+    noCoupangPriceOverride: isFallcentLockedPayload(alert.raw || {}),
+    linkOnlyVerified: isFallcentLockedPayload(alert.raw || {}),
     avg: alert.avg,
     low: alert.low,
     dropPct: alert.dropPct,
@@ -2278,9 +2508,10 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
     const alert = enriched.alert;
     const result = await insertAlert(alert);
-    // v056: 텔레그램 체감속도 우선. 푸시보다 텔레그램을 먼저 보낸다.
-    const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
-    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
+    // v061: 응답 지연 방지. 텔레그램/푸시는 백그라운드 전송하고 HTTP 응답은 즉시 반환한다.
+    const sent = result.inserted ? await sendTelegramPushForResponse(alert) : { telegram: { sent: false, duplicate: true }, push: { sent: 0, duplicate: true } };
+    const telegram = sent.telegram;
+    const push = sent.push;
     res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
@@ -2294,9 +2525,10 @@ app.post('/ingest', async (req, res) => {
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
     const alert = enriched.alert;
     const result = await insertAlert(alert);
-    // v056: 텔레그램 체감속도 우선. 푸시보다 텔레그램을 먼저 보낸다.
-    const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
-    const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
+    // v061: 응답 지연 방지. 텔레그램/푸시는 백그라운드 전송하고 HTTP 응답은 즉시 반환한다.
+    const sent = result.inserted ? await sendTelegramPushForResponse(alert) : { telegram: { sent: false, duplicate: true }, push: { sent: 0, duplicate: true } };
+    const telegram = sent.telegram;
+    const push = sent.push;
     res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, telegram, push });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
